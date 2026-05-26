@@ -25,7 +25,7 @@ namespace FFmpegOut
         {
             return new FFmpegSession(
                 "-y -f rawvideo -vcodec rawvideo -pixel_format rgba"
-                + " -colorspace bt709"
+                + " -colorspace bt709 -color_trc bt709 -color_primaries bt709"
                 + " -video_size " + width + "x" + height
                 + " -framerate " + frameRate
                 + " -loglevel warning -i - " + preset.GetOptions()
@@ -77,13 +77,15 @@ namespace FFmpegOut
                 _blitMaterial = null;
             }
 
-            // 销毁预分配的 RT 池
-            foreach (var rt in _rtPool)
+            foreach (var entry in _readbackQueue)
             {
-                rt.Release();
-                UnityEngine.Object.Destroy(rt);
+                if (entry.rt != null)
+                {
+                    entry.rt.Release();
+                    UnityEngine.Object.Destroy(entry.rt);
+                }
             }
-            _rtPool.Clear();
+            _readbackQueue.Clear();
         }
 
         public void Dispose() => Close();
@@ -96,11 +98,6 @@ namespace FFmpegOut
         Material _blitMaterial;
         int _width;
         int _height;
-
-        // 预分配固定尺寸的 RT 池，避免 GetTemporary 被 HDRP 提前回收
-        const int PoolSize = 8;
-        List<RenderTexture> _rtPool = new List<RenderTexture>(PoolSize);
-        int _rtIndex = 0;
 
         FFmpegSession(string arguments, int width, int height)
         {
@@ -129,47 +126,29 @@ namespace FFmpegOut
                     "before being garbage-collected.");
         }
 
-        // 从池里取下一个 RT（轮转），若未创建则新建
-        RenderTexture GetPooledRT(int width, int height)
-        {
-            // 池未满时扩容
-            if (_rtPool.Count < PoolSize)
-            {
-                var newRT = new RenderTexture(width, height, 0,
-                    RenderTextureFormat.ARGB32);
-                newRT.Create();
-                _rtPool.Add(newRT);
-                return newRT;
-            }
-
-            // 轮转取用
-            var rt = _rtPool[_rtIndex];
-            _rtIndex = (_rtIndex + 1) % PoolSize;
-
-            // 尺寸变化时重建（正常不应发生，但作为安全保障）
-            if (rt.width != width || rt.height != height)
-            {
-                rt.Release();
-                rt.width = width;
-                rt.height = height;
-                rt.Create();
-            }
-
-            return rt;
-        }
-
         #endregion
 
         #region Frame readback queue
 
-        List<AsyncGPUReadbackRequest> _readbackQueue =
-            new List<AsyncGPUReadbackRequest>(4);
+        struct ReadbackEntry
+        {
+            public AsyncGPUReadbackRequest request;
+            public RenderTexture rt;
+        }
+
+        List<ReadbackEntry> _readbackQueue = new List<ReadbackEntry>(4);
 
         void QueueFrame(Texture source)
         {
             if (_readbackQueue.Count > 6)
             {
                 Debug.LogWarning("Too many GPU readback requests.");
+                return;
+            }
+
+            if (source == null)
+            {
+                Debug.LogWarning("[FFmpegOut] QueueFrame called with null source.");
                 return;
             }
 
@@ -185,45 +164,56 @@ namespace FFmpegOut
                 _blitMaterial = new Material(shader);
             }
 
-            // 使用固定尺寸（session 创建时决定），忽略 source 的实际尺寸
-            // 这样保证每帧发给 FFmpeg 的数据大小完全一致
             int w = _width > 0 ? _width : source.width;
             int h = _height > 0 ? _height : source.height;
 
-            // 从池中取持久 RT，不会被 HDRP 提前回收
-            var rt = GetPooledRT(w, h);
+            var rt = new RenderTexture(w, h, 0,
+                RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            rt.Create();
 
             var cmd = CommandBufferPool.Get("FFmpegOut_Preprocess");
             cmd.Blit(source, rt, _blitMaterial, 0);
             Graphics.ExecuteCommandBuffer(cmd);
             CommandBufferPool.Release(cmd);
 
-            // 直接对持久 RT 发起 readback
-            _readbackQueue.Add(AsyncGPUReadback.Request(rt));
+            _readbackQueue.Add(new ReadbackEntry
+            {
+                request = AsyncGPUReadback.Request(rt, 0, TextureFormat.ARGB32),
+                rt = rt
+            });
         }
 
         void ProcessQueue()
         {
             while (_readbackQueue.Count > 0)
             {
-                if (!_readbackQueue[0].done)
+                var entry = _readbackQueue[0];
+
+                if (!entry.request.done)
                 {
-                    if (_readbackQueue.Count > 1 && _readbackQueue[1].done)
-                        _readbackQueue[0].WaitForCompletion();
+                    if (_readbackQueue.Count > 1 && _readbackQueue[1].request.done)
+                        entry.request.WaitForCompletion();
                     else
                         break;
                 }
 
-                var req = _readbackQueue[0];
                 _readbackQueue.RemoveAt(0);
 
-                if (req.hasError)
+                if (entry.request.hasError)
                 {
                     Debug.LogWarning("GPU readback error was detected.");
-                    continue;
+                }
+                else
+                {
+                    var data = entry.request.GetData<byte>();
+                    _pipe.PushFrameData(data);
                 }
 
-                _pipe.PushFrameData(req.GetData<byte>());
+                if (entry.rt != null)
+                {
+                    entry.rt.Release();
+                    UnityEngine.Object.Destroy(entry.rt);
+                }
             }
         }
 

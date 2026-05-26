@@ -27,6 +27,7 @@ namespace FFmpegOut
         RenderTexture _captureRT;
         RTHandle _captureRTHandle;
         CustomPassVolume _customPassVolume;
+        bool _frameReady;
         #endregion
 
         #region Time-keeping
@@ -83,9 +84,42 @@ namespace FFmpegOut
 
         IEnumerator Start()
         {
+            yield return null;
+
             for (var eof = new WaitForEndOfFrame(); ;)
             {
                 yield return eof;
+
+                if (_session != null && _captureRT != null && _frameReady)
+                {
+                    var gap = Time.time - FrameTime;
+                    var delta = 1f / _frameRate;
+
+                    if (gap < 0)
+                    {
+                        _session.PushFrame(null);
+                    }
+                    else if (gap < delta)
+                    {
+                        _session.PushFrame(_captureRT);
+                        _frameCount++;
+                    }
+                    else if (gap < delta * 2)
+                    {
+                        _session.PushFrame(_captureRT);
+                        _session.PushFrame(_captureRT);
+                        _frameCount += 2;
+                    }
+                    else
+                    {
+                        WarnFrameDrop();
+                        _session.PushFrame(_captureRT);
+                        _frameCount += Mathf.FloorToInt(gap * _frameRate);
+                    }
+
+                    _frameReady = false;
+                }
+
                 _session?.CompletePushFrames();
             }
         }
@@ -94,32 +128,28 @@ namespace FFmpegOut
         {
             if (_session == null)
             {
-                // 1. 创建普通 RenderTexture 供 FFmpeg 读回
                 _captureRT = new RenderTexture(_width, _height, 0,
-                    RenderTextureFormat.ARGB32);
+                    RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
                 _captureRT.Create();
 
-                // 2. 把它包装成 RTHandle，供 HDRP Custom Pass 写入
                 _captureRTHandle = RTHandles.Alloc(
                     _captureRT,
-                    transferOwnership: false   // 我们自己管理 RT 生命周期
+                    transferOwnership: false
                 );
 
-                // 3. 挂载 Custom Pass
                 _customPassVolume =
                     gameObject.AddComponent<CustomPassVolume>();
                 _customPassVolume.injectionPoint =
                     CustomPassInjectionPoint.AfterPostProcess;
                 _customPassVolume.isGlobal = true;
 
-                var pass = new CaptureCustomPass(_captureRTHandle)
+                var pass = new CaptureCustomPass(_captureRTHandle, this)
                 {
                     name = "FFmpegOut Capture",
                     enabled = true
                 };
                 _customPassVolume.customPasses.Add(pass);
 
-                // 4. 启动 FFmpeg
                 _session = FFmpegSession.Create(
                     gameObject.name,
                     _width, _height,
@@ -130,57 +160,35 @@ namespace FFmpegOut
                 _frameCount = 0;
                 _frameDropCount = 0;
             }
+        }
 
-            var gap = Time.time - FrameTime;
-            var delta = 1f / _frameRate;
-
-            if (gap < 0)
-            {
-                _session.PushFrame(null);
-            }
-            else if (gap < delta)
-            {
-                _session.PushFrame(_captureRT);
-                _frameCount++;
-            }
-            else if (gap < delta * 2)
-            {
-                _session.PushFrame(_captureRT);
-                _session.PushFrame(_captureRT);
-                _frameCount += 2;
-            }
-            else
-            {
-                WarnFrameDrop();
-                _session.PushFrame(_captureRT);
-                _frameCount += Mathf.FloorToInt(gap * _frameRate);
-            }
+        public void SetFrameReady()
+        {
+            _frameReady = true;
         }
         #endregion
     }
 
-    // ── HDRP Custom Pass ──────────────────────────────────────────────────
     sealed class CaptureCustomPass : CustomPass
     {
         RTHandle _dst;
+        CameraCapture _capture;
 
-        public CaptureCustomPass(RTHandle dst)
+        public CaptureCustomPass(RTHandle dst, CameraCapture capture)
         {
             _dst = dst;
+            _capture = capture;
         }
 
         protected override void Execute(CustomPassContext ctx)
         {
             if (_dst == null) return;
-
-            // HDUtils.BlitCameraTexture 是 HDRP 官方推荐的
-            // RTHandle → RTHandle 拷贝方式，会正确处理格式转换和翻转
             HDUtils.BlitCameraTexture(ctx.cmd, ctx.cameraColorBuffer, _dst);
+            _capture?.SetFrameReady();
         }
 
         protected override void Cleanup()
         {
-            // RTHandle 生命周期由 CameraCapture 管理，这里不释放
         }
     }
 }
