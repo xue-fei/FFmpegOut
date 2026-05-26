@@ -1,3 +1,7 @@
 ﻿{
-	"name": "FFmpegOut"
+	"name": "FFmpegOut",
+	"references": [
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.HighDefinition.Runtime"
+    ]
 }

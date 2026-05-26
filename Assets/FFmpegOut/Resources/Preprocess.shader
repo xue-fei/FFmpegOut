@@ -1,37 +1,54 @@
-﻿// FFmpegOut - FFmpeg video encoding plugin for Unity
-// https://github.com/keijiro/KlakNDI
-
-Shader "Hidden/FFmpegOut/Preprocess"
+﻿Shader "Hidden/FFmpegOut/Preprocess"
 {
     Properties
     {
         _MainTex("", 2D) = "white" {}
     }
 
-    CGINCLUDE
+    HLSLINCLUDE
+    #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
-    #include "UnityCG.cginc"
+    TEXTURE2D(_MainTex);
+    SAMPLER(sampler_MainTex);
 
-    sampler2D _MainTex;
-
-    fixed4 frag_flip(v2f_img i) : SV_Target
+    // Needed for SRP Batcher / full-screen triangle
+    struct Attributes
     {
-        float2 uv = i.uv;
-        uv.y = 1 - uv.y;
-        return tex2D(_MainTex, uv);
+        uint vertexID : SV_VertexID;
+    };
+
+    struct Varyings
+    {
+        float4 positionCS : SV_POSITION;
+        float2 uv         : TEXCOORD0;
+    };
+
+    Varyings Vert(Attributes input)
+    {
+        Varyings output;
+        // Full-screen triangle (no vertex buffer needed)
+        output.positionCS = GetFullScreenTriangleVertexPosition(input.vertexID);
+        output.uv         = GetFullScreenTriangleTexCoord(input.vertexID);
+        return output;
     }
 
-    ENDCG
+    float4 FragFlip(Varyings input) : SV_Target
+    {
+        float2 uv = input.uv;
+        uv.y = 1.0 - uv.y;          // vertical flip (OpenGL → D3D convention)
+        return SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv);
+    }
+    ENDHLSL
 
     SubShader
     {
         Cull Off ZWrite Off ZTest Always
         Pass
         {
-            CGPROGRAM
-            #pragma vertex vert_img
-            #pragma fragment frag_flip
-            ENDCG
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment FragFlip
+            ENDHLSL
         }
     }
 }

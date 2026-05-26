@@ -1,7 +1,6 @@
-// FFmpegOut - FFmpeg video encoding plugin for Unity
-// https://github.com/keijiro/KlakNDI
-
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.HighDefinition;
 using System.Collections;
 
 namespace FFmpegOut
@@ -10,80 +9,43 @@ namespace FFmpegOut
     public sealed class CameraCapture : MonoBehaviour
     {
         #region Public properties
-
         [SerializeField] int _width = 1920;
-
-        public int width {
-            get { return _width; }
-            set { _width = value; }
-        }
+        public int width { get { return _width; } set { _width = value; } }
 
         [SerializeField] int _height = 1080;
-
-        public int height {
-            get { return _height; }
-            set { _height = value; }
-        }
+        public int height { get { return _height; } set { _height = value; } }
 
         [SerializeField] FFmpegPreset _preset;
-
-        public FFmpegPreset preset {
-            get { return _preset; }
-            set { _preset = value; }
-        }
+        public FFmpegPreset preset { get { return _preset; } set { _preset = value; } }
 
         [SerializeField] float _frameRate = 60;
-
-        public float frameRate {
-            get { return _frameRate; }
-            set { _frameRate = value; }
-        }
-
+        public float frameRate { get { return _frameRate; } set { _frameRate = value; } }
         #endregion
 
         #region Private members
-
         FFmpegSession _session;
-        RenderTexture _tempRT;
-        GameObject _blitter;
-
-        RenderTextureFormat GetTargetFormat(Camera camera)
-        {
-            return camera.allowHDR ? RenderTextureFormat.DefaultHDR : RenderTextureFormat.Default;
-        }
-
-        int GetAntiAliasingLevel(Camera camera)
-        {
-            return camera.allowMSAA ? QualitySettings.antiAliasing : 1;
-        }
-
+        RenderTexture _captureRT;
+        RTHandle _captureRTHandle;
+        CustomPassVolume _customPassVolume;
         #endregion
 
-        #region Time-keeping variables
-
+        #region Time-keeping
         int _frameCount;
         float _startTime;
         int _frameDropCount;
 
-        float FrameTime {
-            get { return _startTime + (_frameCount - 0.5f) / _frameRate; }
-        }
+        float FrameTime => _startTime + (_frameCount - 0.5f) / _frameRate;
 
         void WarnFrameDrop()
         {
             if (++_frameDropCount != 10) return;
-
             Debug.LogWarning(
-                "Significant frame droppping was detected. This may introduce " +
-                "time instability into output video. Decreasing the recording " +
-                "frame rate is recommended."
-            );
+                "Significant frame dropping detected. " +
+                "Decrease the recording frame rate.");
         }
-
         #endregion
 
-        #region MonoBehaviour implementation
-
+        #region MonoBehaviour
         void OnValidate()
         {
             _width = Mathf.Max(8, _width);
@@ -94,32 +56,34 @@ namespace FFmpegOut
         {
             if (_session != null)
             {
-                // Close and dispose the FFmpeg session.
                 _session.Close();
                 _session.Dispose();
                 _session = null;
             }
 
-            if (_tempRT != null)
+            if (_customPassVolume != null)
             {
-                // Dispose the frame texture.
-                GetComponent<Camera>().targetTexture = null;
-                Destroy(_tempRT);
-                _tempRT = null;
+                Destroy(_customPassVolume);
+                _customPassVolume = null;
             }
 
-            if (_blitter != null)
+            if (_captureRTHandle != null)
             {
-                // Destroy the blitter game object.
-                Destroy(_blitter);
-                _blitter = null;
+                _captureRTHandle.Release();
+                _captureRTHandle = null;
+            }
+
+            if (_captureRT != null)
+            {
+                _captureRT.Release();
+                Destroy(_captureRT);
+                _captureRT = null;
             }
         }
 
         IEnumerator Start()
         {
-            // Sync with FFmpeg pipe thread at the end of every frame.
-            for (var eof = new WaitForEndOfFrame();;)
+            for (var eof = new WaitForEndOfFrame(); ;)
             {
                 yield return eof;
                 _session?.CompletePushFrames();
@@ -128,28 +92,38 @@ namespace FFmpegOut
 
         void Update()
         {
-            var camera = GetComponent<Camera>();
-
-            // Lazy initialization
             if (_session == null)
             {
-                // Give a newly created temporary render texture to the camera
-                // if it's set to render to a screen. Also create a blitter
-                // object to keep frames presented on the screen.
-                if (camera.targetTexture == null)
-                {
-                    _tempRT = new RenderTexture(_width, _height, 24, GetTargetFormat(camera)); 
-                    _tempRT.antiAliasing = GetAntiAliasingLevel(camera);
-                    camera.targetTexture = _tempRT;
-                    _blitter = Blitter.CreateInstance(camera);
-                }
+                // 1. 创建普通 RenderTexture 供 FFmpeg 读回
+                _captureRT = new RenderTexture(_width, _height, 0,
+                    RenderTextureFormat.ARGB32);
+                _captureRT.Create();
 
-                // Start an FFmpeg session.
+                // 2. 把它包装成 RTHandle，供 HDRP Custom Pass 写入
+                _captureRTHandle = RTHandles.Alloc(
+                    _captureRT,
+                    transferOwnership: false   // 我们自己管理 RT 生命周期
+                );
+
+                // 3. 挂载 Custom Pass
+                _customPassVolume =
+                    gameObject.AddComponent<CustomPassVolume>();
+                _customPassVolume.injectionPoint =
+                    CustomPassInjectionPoint.AfterPostProcess;
+                _customPassVolume.isGlobal = true;
+
+                var pass = new CaptureCustomPass(_captureRTHandle)
+                {
+                    name = "FFmpegOut Capture",
+                    enabled = true
+                };
+                _customPassVolume.customPasses.Add(pass);
+
+                // 4. 启动 FFmpeg
                 _session = FFmpegSession.Create(
                     gameObject.name,
-                    camera.targetTexture.width,
-                    camera.targetTexture.height,
-                    _frameRate, preset
+                    _width, _height,
+                    _frameRate, _preset
                 );
 
                 _startTime = Time.time;
@@ -158,43 +132,55 @@ namespace FFmpegOut
             }
 
             var gap = Time.time - FrameTime;
-            var delta = 1 / _frameRate;
+            var delta = 1f / _frameRate;
 
             if (gap < 0)
             {
-                // Update without frame data.
                 _session.PushFrame(null);
             }
             else if (gap < delta)
             {
-                // Single-frame behind from the current time:
-                // Push the current frame to FFmpeg.
-                _session.PushFrame(camera.targetTexture);
+                _session.PushFrame(_captureRT);
                 _frameCount++;
             }
             else if (gap < delta * 2)
             {
-                // Two-frame behind from the current time:
-                // Push the current frame twice to FFmpeg. Actually this is not
-                // an efficient way to catch up. We should think about
-                // implementing frame duplication in a more proper way. #fixme
-                _session.PushFrame(camera.targetTexture);
-                _session.PushFrame(camera.targetTexture);
+                _session.PushFrame(_captureRT);
+                _session.PushFrame(_captureRT);
                 _frameCount += 2;
             }
             else
             {
-                // Show a warning message about the situation.
                 WarnFrameDrop();
-
-                // Push the current frame to FFmpeg.
-                _session.PushFrame(camera.targetTexture);
-
-                // Compensate the time delay.
+                _session.PushFrame(_captureRT);
                 _frameCount += Mathf.FloorToInt(gap * _frameRate);
             }
         }
-
         #endregion
+    }
+
+    // ── HDRP Custom Pass ──────────────────────────────────────────────────
+    sealed class CaptureCustomPass : CustomPass
+    {
+        RTHandle _dst;
+
+        public CaptureCustomPass(RTHandle dst)
+        {
+            _dst = dst;
+        }
+
+        protected override void Execute(CustomPassContext ctx)
+        {
+            if (_dst == null) return;
+
+            // HDUtils.BlitCameraTexture 是 HDRP 官方推荐的
+            // RTHandle → RTHandle 拷贝方式，会正确处理格式转换和翻转
+            HDUtils.BlitCameraTexture(ctx.cmd, ctx.cameraColorBuffer, _dst);
+        }
+
+        protected override void Cleanup()
+        {
+            // RTHandle 生命周期由 CameraCapture 管理，这里不释放
+        }
     }
 }
