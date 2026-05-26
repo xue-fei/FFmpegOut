@@ -25,7 +25,7 @@ namespace FFmpegOut
         {
             return new FFmpegSession(
                 "-y -f rawvideo -vcodec rawvideo -pixel_format rgba"
-                + " -colorspace bt709 -color_trc bt709 -color_primaries bt709"
+                + " -colorspace bt709"
                 + " -video_size " + width + "x" + height
                 + " -framerate " + frameRate
                 + " -loglevel warning -i - " + preset.GetOptions()
@@ -178,7 +178,11 @@ namespace FFmpegOut
 
             _readbackQueue.Add(new ReadbackEntry
             {
+#if UNITY_EDITOR
                 request = AsyncGPUReadback.Request(rt, 0, TextureFormat.ARGB32),
+#else
+                request = AsyncGPUReadback.Request(rt),
+#endif
                 rt = rt
             });
         }
